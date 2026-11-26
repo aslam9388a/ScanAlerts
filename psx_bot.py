@@ -9,7 +9,7 @@ from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 import requests
 
-NEAR_LOW_PCT = 5.0          # 52-week low se kitne % tak ko near low maan'na hai
+NEAR_LOW_PCT = 20.0         # 52-week low se kitne % tak ko near low maan'na hai
 SEND_WHEN_NO_MATCH = True   # Test ke liye True; jab sirf matches par email chahiye ho toh False kar dein
 MAX_WORKERS = 15            # 228 symbols ko tez scan karne ke liye parallel threads
 
@@ -173,7 +173,7 @@ def scan_symbols(symbols):
             seen.add(sym)
             clean_symbols.append(sym)
 
-    print(f"Scanning {len(clean_symbols)} symbols...")
+    print(f"Scanning {len(clean_symbols)} symbols (Near Low threshold: {NEAR_LOW_PCT}%)...")
     exact_lows = []
     near_lows = []
     scanned_list = sorted(clean_symbols)
@@ -260,7 +260,7 @@ def main():
         ", ".join(scanned_list) if scanned_list else "None",
     ])
 
-    subject = f"PSX 52W Low Scan: {len(exact_lows)} At Low, {len(near_lows)} Near Low ({len(scanned_list)} Symbols)"
+    subject = f"PSX 52W Low Scan: {len(exact_lows)} At Low, {len(near_lows)} Near 20% Low ({len(scanned_list)} Symbols)"
     send_email(subject, "\n".join(lines))
 
 
