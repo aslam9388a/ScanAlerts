@@ -2,60 +2,77 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 import smtplib
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from pathlib import Path
 from bs4 import BeautifulSoup
 import requests
 
 NEAR_LOW_PCT = 5.0          # 52-week low se kitne % tak ko near low maan'na hai
 SEND_WHEN_NO_MATCH = True   # Test ke liye True; jab sirf matches par email chahiye ho toh False kar dein
-MAX_WORKERS = 15            # All symbols ko tez scan karne ke liye parallel threads
-SYMBOLS_FILE = "symbols.txt"
+MAX_WORKERS = 15            # 228 symbols ko tez scan karne ke liye parallel threads
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/html, */*; q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://dps.psx.com.pk/",
 }
 
-DEFAULT_SYMBOLS = [
-    "OGDC", "PPL", "MARI", "PSO", "SNGP", "SSGC", "HUBC", "KEL", "MEBL", "HBL",
-    "UBL", "MCB", "NBP", "BAFL", "AKBL", "FABL", "LUCK", "DGKC", "MLCF", "FCCL",
-    "CHCC", "PIOC", "ENGRO", "FFC", "FFBL", "EFERT", "FATIMA", "SYS", "TRG", "NETSOL",
-    "AVN", "PAEL", "GATM", "NML", "ILP", "KTML", "SEARL", "GLAXO", "HALEON", "ATRL",
-    "PRL", "NRL", "BYCO", "CNERGY", "GHNI", "INDU", "HCAR", "PSMC", "MTL", "EPCL",
-    "LOTCHEM", "PTC", "TPL", "AIRLINK", "HUMNL", "WTL", "PIBTL", "KOSM", "UNITY", "FFL",
+# Kul 228 PSX symbols jo har run mein scan honge
+PSX_SYMBOLS = [
+    "PASLNC", "WTL", "ZALR", "SSGC", "DCL", "LSEFSL", "CNERGY", "YOUW", "TPLL", "STPL",
+    "LSECL", "TPLRF1", "BOP", "KOSM", "PRL", "PACE", "FNEL", "TELE", "TPLP", "CLVL",
+    "TISL", "TREET", "PIBTL", "LIVEN", "MLCF", "TPL", "PIAHCLA", "PREMA", "DFMLNC", "NGLEL",
+    "GCIL", "KEL", "TSBL", "TSPL", "GATM", "TPLT", "TRG", "LOADS", "UNITY", "ARUJNC",
+    "AHCL", "ORM", "PGLC", "PSO", "KTML", "FDPL", "FCCL", "BLUEX", "ENGROH", "MDTL",
+    "DGKC", "FPRM", "NBP", "AICL", "AGHA", "RPL", "DNCC", "SPEL", "EFERT", "ASL",
+    "ILP", "SNGPXD", "BECO", "UCAPM", "ZUMA", "PAKRI", "BNL", "ZTL", "HUBC", "PTC",
+    "HASCOLNC", "NML", "CLCPS", "CLOV", "NRL", "PAEL", "FIBLM", "OBOYNC", "THCCLXD", "OGDC",
+    "FFL", "BAFL", "GDL", "TSMF", "FCSC", "GGGL", "PPL", "CSIL", "LOTCHEM", "PILNC",
+    "OML", "GWLC", "UVICR1", "PICT", "NCL", "TRSM", "AGP", "WAVESAPP", "DBCINC", "SELECT",
+    "CPPL", "ZALXR", "SYS", "SLM", "WASL", "BBFL", "GGL", "NCPL", "FEM", "MZNPETF",
+    "TOMCL", "BPLXD", "FCL", "SPSL", "SLGL", "STCL", "ATRL", "QUICE", "LSEVL", "DSLNC",
+    "TBL", "ITANZ", "ABHI", "FANM", "JSMFETF", "BAHL", "SEARL", "FATIMA", "LUCK", "DSIL",
+    "ANL", "UDLI", "PASMNC", "MACFL", "KAPCO", "FCEPL", "FFC", "WAVES", "KOHC", "CWHC",
+    "MARI", "AMTEXNC", "ICCI", "UBL", "RUPL", "IREIT", "WAHDAT", "PPVCNC", "NPL", "STL",
+    "MEBL", "NRSL", "DWSMNC", "CEPB", "MFL", "AIRLINK", "HBL", "MIIETF", "AKBL", "HWQSNC",
+    "EPQL", "GSPMNC", "HUMNL", "TGL", "EPCL", "CTMNC", "DEL", "GCWL", "FABL", "DFSMNC",
+    "TCORP", "DCR", "PSX", "GLAXO", "ALTN", "MUGHAL", "ISL", "UBLPETF", "HCAR", "CHBLNC",
+    "AMBL", "MCB", "MEHT", "GUSMWU", "AVN", "BML", "GAL", "ECOP", "BCL", "SPWL",
+    "FPJM", "UNIC", "ASCNC", "GATI", "BGL", "JSBL", "IPAK", "HRPL", "BIPL", "KOHTM",
+    "POWER", "CJPLWU", "SPAC2", "KML", "SIBL", "DLL", "SZTM", "ITTEFAQ", "SERTNC", "NETSOL",
+    "ASHT", "QTECH", "ASTL", "BAPL", "GOC", "MTL", "PRWM", "CCM", "ICL", "CPHL",
+    "RUBYNC", "FFLMNC", "IBLHL", "LPGL", "HTL", "BRRG", "JVDC", "NATF", "ADMM", "ARMG",
+    "AGSML", "786", "GTYR", "LEUL", "FECM", "SYM", "KOIL", "JSCL", "SINDM", "AKDSL",
+    "STML", "SHNI", "FCIBL", "NCMLNC", "INIL", "MIRKS", "KOHE", "IMAGEXD", "BERG", "MRNS",
+    "ANSM", "OCTOPUS", "SAIF", "ATBA", "PAKQATAR", "SGF", "FML", "JATM", "PKGI", "UVIC",
+    "OTSU", "SAZEW", "SNAI", "SMCPL", "DAAG", "FTMM", "KOHP", "IDRT", "CHCC", "GHNI",
+    "PIOC", "POL", "BFAGRO", "HIFA", "GHGL", "REDCO", "MSCL", "GRR", "KSTMNC", "SBL",
+    "SNBL", "EMCO", "NNAR", "HALEON", "KSBP", "PABC", "TOWL", "CSAP", "FTSM", "GADT",
+    "BELANC", "DIIL", "BFMOD", "POML", "HBLTETF", "SOYASUP", "BFBIO", "ARCTM", "PAKL", "IMS",
+    "DOL", "MWMP", "LCI", "AGL", "JSIL", "ASTM", "SSML", "SHDT", "SKRSNC", "UBDL",
+    "HMB", "HINO", "MERIT", "HICL", "NATM", "PTL", "PNSC", "ALIFE", "ICIBL", "PRET",
+    "PQGTL", "MSOT", "PINL", "CRTM", "FHAM", "TATM", "JDMT", "FCELNC", "ABL", "UDPL",
+    "LPL", "BWCL", "JKSM", "GAMONNC", "MACTER", "BIFO", "WAFI", "JAZZSURE", "NBPGETF", "OLPL",
+    "FLYNG", "AATM", "SLYTWU", "HGFA", "EXIDE", "FECTC", "ALAC", "COLG", "JSRR", "ESBLNC",
+    "CENI", "BOK", "THALL", "ZAHID", "APL", "ASICR2", "CHAS", "BWHL", "SPLNC", "GFILNC",
+    "SARC", "IGIHL", "GRYL", "PSYL", "JGICL", "IDYM", "SRR", "ANLNV", "TICL", "DWAENC",
+    "BUXL", "SHEZ", "HABSM", "PSEL", "QUETNC", "ATIL", "NAGC", "SHFA", "FRCL", "JSGBETF",
+    "DADX", "SUTM", "PIM", "TSML", "BNWM", "NITGETF", "AHL", "ALNRS", "SRVI", "EPCLPS",
+    "NICL", "EFUL", "INKL", "HAEL", "SURC", "NONS", "JSML", "WAHN", "DYNO", "INDU",
+    "AGTL", "TRIPF", "SEPL", "PKGP", "ACPL", "AGIC", "HINOON", "NEXT", "DINT", "AGIL",
+    "PAKD", "SEL", "CFL", "PPP", "PAKT", "MQTM", "SSOM", "FEROZ", "SHCM", "DWTMWU",
+    "IGIL", "PAKOXY", "PKGS", "BAFS", "RICL", "NSRM", "MFFL", "AKGL", "SMLNC", "SCBPL",
+    "ANTM", "ARPL", "STJT", "KPUS", "ADAMS", "ABOT", "HUSI", "JLICL", "BHAT", "KHTC",
+    "FZCM", "GVGL", "FSWLNC", "ARPAK", "ACIETF", "ATLH", "SUHJNC", "SITC", "JUBSNC", "SHSML",
+    "ASLPS", "AABS", "ASIC", "PECONC", "KCL", "IMLNC", "JDWS", "SHJS", "NESTLE", "PCAL",
+    "IDEAL", "SANSM", "FRSM", "MCBIM", "FASM", "BATA", "FILNC", "AKDHL", "ZIL", "JSGCL",
+    "PMRS", "MUREB", "IBFL", "EFUG", "FIMM", "DMC", "OLPM", "HPL", "AHTM", "SIEM",
+    "SAPT", "UPFL", "SFL", "RMPL", "POWERPS", "REWM", "ELSM", "BTL", "KHYT", "HAFL",
+    "SASML", "ELCM", "PIAHCLB", "ASLCPS", "ISIL", "JVDCPS", "STYLERS",
 ]
-
-
-def load_all_symbols():
-    """symbols.txt se tamam symbols load karta hai; na ho toh DEFAULT_SYMBOLS use karta hai."""
-    symbols = []
-    seen = set()
-
-    def add_token(tok):
-        clean = re.sub(r"[^A-Za-z0-9]", "", tok.split("-")[0]).upper()
-        if 2 <= len(clean) <= 10 and not clean.isdigit() and clean not in seen:
-            seen.add(clean)
-            symbols.append(clean)
-
-    path = Path(SYMBOLS_FILE)
-    if path.exists():
-        raw_text = path.read_text(encoding="utf-8", errors="ignore")
-        for part in re.split(r"[\r\n,;|\t]+", raw_text):
-            tok = part.strip()
-            if tok and not tok.startswith("#"):
-                add_token(tok)
-        print(f"Loaded {len(symbols)} symbols from {SYMBOLS_FILE}")
-        if symbols:
-            return symbols
-
-    for s in DEFAULT_SYMBOLS:
-        add_token(s)
-    print(f"Using built-in symbol list ({len(symbols)} symbols)")
-    return symbols
 
 
 def _parse_52w_from_eod_json(payload):
@@ -63,7 +80,6 @@ def _parse_52w_from_eod_json(payload):
     if not isinstance(rows, list) or not rows:
         return None
 
-    import time
     cutoff_sec = time.time() - (370 * 86400)
     closes = []
     lows = []
@@ -149,10 +165,18 @@ def check_symbol_52w(symbol):
 
 
 def scan_symbols(symbols):
-    print(f"Scanning {len(symbols)} symbols...")
+    clean_symbols = []
+    seen = set()
+    for s in symbols:
+        sym = str(s).strip().upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            clean_symbols.append(sym)
+
+    print(f"Scanning {len(clean_symbols)} symbols...")
     exact_lows = []
     near_lows = []
-    scanned_list = sorted(symbols)
+    scanned_list = sorted(clean_symbols)
     data_found_count = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -200,8 +224,7 @@ def send_email(subject, body_text):
 
 
 def main():
-    symbols = load_all_symbols()
-    scanned_list, data_found_count, exact_lows, near_lows = scan_symbols(symbols)
+    scanned_list, data_found_count, exact_lows, near_lows = scan_symbols(PSX_SYMBOLS)
     total_matches = len(exact_lows) + len(near_lows)
 
     if total_matches == 0 and not SEND_WHEN_NO_MATCH:
