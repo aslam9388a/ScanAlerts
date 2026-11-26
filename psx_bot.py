@@ -9,7 +9,8 @@ from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 import requests
 
-NEAR_LOW_PCT = 20.0         # 52-week low se kitne % tak ko near low maan'na hai
+NEAR_LOW_PCT = 20.0         # 52-week range low se kitne % tak ko match maan'na hai
+EXACT_LOW_PCT = 0.5         # 52-week range low ke bilkul qareeb/barabar maan'ne ki limit
 SEND_WHEN_NO_MATCH = True   # Test ke liye True; jab sirf matches par email chahiye ho toh False kar dein
 MAX_WORKERS = 15            # 228 symbols ko tez scan karne ke liye parallel threads
 
@@ -75,14 +76,16 @@ PSX_SYMBOLS = [
 ]
 
 
-def _parse_52w_from_eod_json(payload):
+def _extract_52w_range_from_eod(payload):
+    """Pichle ~52 weeks (365 din) ke data se 52-Week Range Low, High aur current price nikaalta hai."""
     rows = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(rows, list) or not rows:
         return None
 
-    cutoff_sec = time.time() - (370 * 86400)
+    cutoff_sec = time.time() - (365 * 86400)
     closes = []
     lows = []
+    highs = []
 
     for item in rows:
         if not isinstance(item, (list, tuple)) or len(item) < 5:
@@ -93,27 +96,34 @@ def _parse_52w_from_eod_json(payload):
             if ts_sec < cutoff_sec:
                 continue
 
-        prices = [float(x) for x in item[1:5] if isinstance(x, (int, float)) and x > 0]
-        if not prices:
-            continue
-        low_val = float(item[3]) if isinstance(item[3], (int, float)) and item[3] > 0 else min(prices)
-        close_val = float(item[4]) if isinstance(item[4], (int, float)) and item[4] > 0 else prices[-1]
-        lows.append(low_val)
-        closes.append(close_val)
+        # PSX EOD format: [timestamp, open, high, low, close, volume]
+        high_val = float(item[2]) if isinstance(item[2], (int, float)) and item[2] > 0 else None
+        low_val = float(item[3]) if isinstance(item[3], (int, float)) and item[3] > 0 else None
+        close_val = float(item[4]) if isinstance(item[4], (int, float)) and item[4] > 0 else None
+
+        if low_val is not None:
+            lows.append(low_val)
+        if high_val is not None:
+            highs.append(high_val)
+        if close_val is not None:
+            closes.append(close_val)
 
     if not closes or not lows:
         return None
 
     current_price = closes[-1]
-    low_52w = min(lows)
-    if low_52w <= 0:
+    range_52w_low = min(lows)
+    range_52w_high = max(highs) if highs else None
+
+    if range_52w_low <= 0:
         return None
 
-    diff_pct = ((current_price - low_52w) / low_52w) * 100.0
-    return current_price, low_52w, diff_pct
+    above_low_pct = ((current_price - range_52w_low) / range_52w_low) * 100.0
+    return current_price, range_52w_low, range_52w_high, above_low_pct
 
 
-def _parse_52w_from_company_page(symbol):
+def _extract_52w_range_from_company_page(symbol):
+    """Fallback: /company/{symbol} page se 52-Week Range Low/High aur current price nikaalta hai."""
     url = f"https://dps.psx.com.pk/company/{symbol}"
     r = requests.get(url, headers=HEADERS, timeout=15)
     if r.status_code != 200 or not r.text:
@@ -133,38 +143,41 @@ def _parse_52w_from_company_page(symbol):
         return None
 
     current_price = float(price_match.group(1).replace(",", ""))
-    low_52w = float(range_match.group(1).replace(",", ""))
-    if current_price <= 0 or low_52w <= 0:
+    range_52w_low = float(range_match.group(1).replace(",", ""))
+    range_52w_high = float(range_match.group(2).replace(",", ""))
+
+    if current_price <= 0 or range_52w_low <= 0:
         return None
 
-    diff_pct = ((current_price - low_52w) / low_52w) * 100.0
-    return current_price, low_52w, diff_pct
+    above_low_pct = ((current_price - range_52w_low) / range_52w_low) * 100.0
+    return current_price, range_52w_low, range_52w_high, above_low_pct
 
 
-def check_symbol_52w(symbol):
+def check_symbol_52w_range_low(symbol):
+    """Symbol ki 52-Week Range Low se distance check karta hai."""
     url = f"https://dps.psx.com.pk/timeseries/eod/{symbol}"
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code == 200 and r.text.strip().startswith(("{", "[")):
-            parsed = _parse_52w_from_eod_json(r.json())
+            parsed = _extract_52w_range_from_eod(r.json())
             if parsed:
-                price, low_52w, diff_pct = parsed
-                return (symbol, price, low_52w, diff_pct)
+                price, low_52w, high_52w, above_low_pct = parsed
+                return (symbol, price, low_52w, high_52w, above_low_pct)
     except Exception:
         pass
 
     try:
-        fallback = _parse_52w_from_company_page(symbol)
+        fallback = _extract_52w_range_from_company_page(symbol)
         if fallback:
-            price, low_52w, diff_pct = fallback
-            return (symbol, price, low_52w, diff_pct)
+            price, low_52w, high_52w, above_low_pct = fallback
+            return (symbol, price, low_52w, high_52w, above_low_pct)
     except Exception:
         pass
 
     return None
 
 
-def scan_symbols(symbols):
+def scan_52w_range_lows(symbols):
     clean_symbols = []
     seen = set()
     for s in symbols:
@@ -173,30 +186,34 @@ def scan_symbols(symbols):
             seen.add(sym)
             clean_symbols.append(sym)
 
-    print(f"Scanning {len(clean_symbols)} symbols (Near Low threshold: {NEAR_LOW_PCT}%)...")
-    exact_lows = []
-    near_lows = []
+    print(
+        f"Scanning {len(clean_symbols)} symbols for 52-Week Range Low "
+        f"(At Low <= {EXACT_LOW_PCT}%, Near Low <= {NEAR_LOW_PCT}%)..."
+    )
+
+    at_52w_low = []
+    near_52w_low = []
     scanned_list = sorted(clean_symbols)
     data_found_count = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(check_symbol_52w, sym): sym for sym in scanned_list}
+        futures = {pool.submit(check_symbol_52w_range_low, sym): sym for sym in scanned_list}
         for future in as_completed(futures):
             res = future.result()
             if not res:
                 continue
             data_found_count += 1
-            _, _, _, diff_pct = res
-            if diff_pct <= 0.1:
-                exact_lows.append(res)
-            elif diff_pct <= NEAR_LOW_PCT:
-                near_lows.append(res)
+            _, _, _, _, above_low_pct = res
+            if above_low_pct <= EXACT_LOW_PCT:
+                at_52w_low.append(res)
+            elif above_low_pct <= NEAR_LOW_PCT:
+                near_52w_low.append(res)
 
     print(
-        f"Scan Complete | Total Symbols: {len(scanned_list)} | Price Data Found: {data_found_count} | "
-        f"At 52W Low: {len(exact_lows)} | Near 52W Low (<={NEAR_LOW_PCT}%): {len(near_lows)}"
+        f"Scan Complete | Symbols: {len(scanned_list)} | Data Found: {data_found_count} | "
+        f"At 52W Low: {len(at_52w_low)} | Within {NEAR_LOW_PCT}% of 52W Low: {len(near_52w_low)}"
     )
-    return scanned_list, data_found_count, exact_lows, near_lows
+    return scanned_list, data_found_count, at_52w_low, near_52w_low
 
 
 def send_email(subject, body_text):
@@ -223,34 +240,43 @@ def send_email(subject, body_text):
     print(f"Email sent successfully to {receiver}")
 
 
+def _format_match_line(item):
+    sym, price, low_52w, high_52w, above_low_pct = item
+    high_str = f"{high_52w:>8.2f}" if isinstance(high_52w, (int, float)) else "     N/A"
+    return (
+        f"{sym:<10} | Price: {price:>8.2f} | "
+        f"52W Low: {low_52w:>8.2f} | 52W High: {high_str} | +{above_low_pct:.2f}% above low"
+    )
+
+
 def main():
-    scanned_list, data_found_count, exact_lows, near_lows = scan_symbols(PSX_SYMBOLS)
-    total_matches = len(exact_lows) + len(near_lows)
+    scanned_list, data_found_count, at_52w_low, near_52w_low = scan_52w_range_lows(PSX_SYMBOLS)
+    total_matches = len(at_52w_low) + len(near_52w_low)
 
     if total_matches == 0 and not SEND_WHEN_NO_MATCH:
-        print("No matches found and SEND_WHEN_NO_MATCH is False. Email skipped.")
+        print("No 52-week range low matches found and SEND_WHEN_NO_MATCH is False. Email skipped.")
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"PSX 52-Week Low Scan Report ({now_str})",
-        f"Total Symbols Scanned: {len(scanned_list)} (Price Data Found: {data_found_count})",
-        f"At 52W Low: {len(exact_lows)} | Near 52W Low (<= {NEAR_LOW_PCT}%): {len(near_lows)}",
+        f"PSX 52-Week Range Low Scan Report ({now_str})",
+        f"Total Symbols Scanned: {len(scanned_list)} (52W Data Found: {data_found_count})",
+        f"At 52W Range Low (<= {EXACT_LOW_PCT}%): {len(at_52w_low)} | Within {NEAR_LOW_PCT}% of 52W Low: {len(near_52w_low)}",
         "",
-        "=== AT 52-WEEK LOW ===",
+        f"=== AT 52-WEEK RANGE LOW (<= {EXACT_LOW_PCT}%) ===",
     ]
 
-    if exact_lows:
-        for sym, price, low_52w, diff_pct in sorted(exact_lows, key=lambda x: x[3]):
-            lines.append(f"{sym:<10} | Price: {price:>8.2f} | 52W Low: {low_52w:>8.2f} | +{diff_pct:.2f}%")
+    if at_52w_low:
+        for item in sorted(at_52w_low, key=lambda x: x[4]):
+            lines.append(_format_match_line(item))
     else:
         lines.append("None")
 
-    lines.extend(["", f"=== NEAR 52-WEEK LOW (<= {NEAR_LOW_PCT}%) ==="])
+    lines.extend(["", f"=== NEAR 52-WEEK RANGE LOW (<= {NEAR_LOW_PCT}%) ==="])
 
-    if near_lows:
-        for sym, price, low_52w, diff_pct in sorted(near_lows, key=lambda x: x[3]):
-            lines.append(f"{sym:<10} | Price: {price:>8.2f} | 52W Low: {low_52w:>8.2f} | +{diff_pct:.2f}%")
+    if near_52w_low:
+        for item in sorted(near_52w_low, key=lambda x: x[4]):
+            lines.append(_format_match_line(item))
     else:
         lines.append("None")
 
@@ -260,7 +286,10 @@ def main():
         ", ".join(scanned_list) if scanned_list else "None",
     ])
 
-    subject = f"PSX 52W Low Scan: {len(exact_lows)} At Low, {len(near_lows)} Near 20% Low ({len(scanned_list)} Symbols)"
+    subject = (
+        f"PSX 52W Range Low Scan: {len(at_52w_low)} At Low, "
+        f"{len(near_52w_low)} Within {NEAR_LOW_PCT:.0f}% ({len(scanned_list)} Symbols)"
+    )
     send_email(subject, "\n".join(lines))
 
 
