@@ -1,88 +1,113 @@
 import os
+import re
 import smtplib
 import time
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from bs4 import BeautifulSoup
 import requests
 
 NEAR_LOW_PCT = 5.0  # 52-week low se kitne % tak ko near low maan'na hai
 SEND_WHEN_NO_MATCH = True  # Test verification ke liye True; sirf alerts ke liye False karein
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+SYMBOL_URLS = [
+    "https://dps.psx.com.pk/",
+    "https://dps.psx.com.pk/market-summary",
+    "https://dps.psx.com.pk/market-watch",
+]
 
-def get_psx_symbols():
-    """PSX market summary se symbols ki list nikaalta hai."""
-    url = "https://dps.psx.com.pk/market-watch"
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
 
-    # HTML table se symbol links/text nikaalne ka light-weight tareeqa
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(resp.text, "html.parser")
+def _extract_symbols_from_html(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
     symbols = []
     seen = set()
 
+    # 1) Table rows se pehla column try karein
     for row in soup.select("table tr"):
         cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
         if cols:
-            sym = cols[0].upper()
-            if sym and sym.isalnum() and len(sym) <= 12 and sym not in seen:
+            sym = cols[0].strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{2,10}", sym) and sym not in seen:
                 seen.add(sym)
                 symbols.append(sym)
+
+    # 2) Agar table se symbols kam aayein toh /company/ ya /symbols/ links check karein
+    if len(symbols) < 10:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            m = re.search(r"/(?:company|symbol|quotes)/([A-Za-z0-9]{2,10})", href)
+            if m:
+                sym = m.group(1).upper()
+                if sym not in seen:
+                    seen.add(sym)
+                    symbols.append(sym)
 
     return symbols
 
 
+def get_psx_symbols():
+    """Multiple PSX pages se symbols ki list nikaalta hai."""
+    for url in SYMBOL_URLS:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            if resp.status_code != 200:
+                print(f"Skipping {url} -> HTTP {resp.status_code}")
+                continue
+
+            syms = _extract_symbols_from_html(resp.text)
+            print(f"Fetched {len(syms)} symbols from {url}")
+            if syms:
+                return syms
+        except Exception as e:
+            print(f"Error fetching {url}: {e}")
+            continue
+
+    raise RuntimeError("Could not fetch PSX symbols from any endpoint.")
+
+
 def get_52w_low_info(symbol):
     """Kisi symbol ke liye current price aur taqreeban 52-week low nikaalta hai."""
-    end_ts = int(time.time())
     start_ts = int((datetime.utcnow() - timedelta(days=370)).timestamp())
+    url = f"https://dps.psx.com.pk/timeseries/eod/{symbol}"
 
-    # PSX DPS historical/intraday chart endpoint try karein
-    urls = [
-        f"https://dps.psx.com.pk/timeseries/eod/{symbol}",
-    ]
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        rows = data.get("data") if isinstance(data, dict) else data
+        if not rows or not isinstance(rows, list):
+            return None
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code != 200:
+        closes = []
+        lows = []
+
+        for item in rows:
+            if not isinstance(item, (list, tuple)) or len(item) < 5:
                 continue
-            data = r.json()
-            # Format aksar list of [timestamp, open, high, low, close, volume] hota hai
-            rows = data.get("data") if isinstance(data, dict) else data
-            if not rows or not isinstance(rows, list):
+            ts = item[0]
+            if isinstance(ts, (int, float)) and ts < start_ts:
                 continue
+            low_val = item[3]
+            close_val = item[4]
+            if isinstance(low_val, (int, float)) and low_val > 0:
+                lows.append(float(low_val))
+            if isinstance(close_val, (int, float)) and close_val > 0:
+                closes.append(float(close_val))
 
-            cutoff = start_ts
-            closes = []
-            lows = []
-
-            for item in rows:
-                if not isinstance(item, (list, tuple)) or len(item) < 5:
-                    continue
-                ts = item[0]
-                if ts is not None and ts < cutoff:
-                    continue
-                low_val = item[3]
-                close_val = item[4]
-                if isinstance(low_val, (int, float)) and low_val > 0:
-                    lows.append(float(low_val))
-                if isinstance(close_val, (int, float)) and close_val > 0:
-                    closes.append(float(close_val))
-
-            if closes and lows:
-                current_price = closes[-1]
-                low_52w = min(lows)
-                diff_pct = ((current_price - low_52w) / low_52w) * 100.0
-                return current_price, low_52w, diff_pct
-        except Exception:
-            continue
+        if closes and lows:
+            current_price = closes[-1]
+            low_52w = min(lows)
+            diff_pct = ((current_price - low_52w) / low_52w) * 100.0
+            return current_price, low_52w, diff_pct
+    except Exception:
+        return None
 
     return None
 
@@ -90,7 +115,7 @@ def get_52w_low_info(symbol):
 def scan_psx():
     print("Starting PSX 52-week low scan...")
     symbols = get_psx_symbols()
-    print(f"Symbols fetched from PSX: {len(symbols)}")
+    print(f"Total symbols to scan: {len(symbols)}")
 
     exact_lows = []
     near_lows = []
@@ -108,7 +133,6 @@ def scan_psx():
         elif diff_pct <= NEAR_LOW_PCT:
             near_lows.append((sym, price, low_52w, diff_pct))
 
-        # Rate limit se bachne ke liye halka sa pause
         if checked % 25 == 0:
             time.sleep(0.5)
 
