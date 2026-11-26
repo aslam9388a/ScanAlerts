@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import smtplib
@@ -13,62 +14,101 @@ SEND_WHEN_NO_MATCH = True  # Test verification ke liye True; sirf alerts ke liye
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Referer": "https://dps.psx.com.pk/",
 }
 
-SYMBOL_URLS = [
-    "https://dps.psx.com.pk/",
+SYMBOL_SOURCES = [
     "https://dps.psx.com.pk/market-summary",
+    "https://dps.psx.com.pk/",
     "https://dps.psx.com.pk/market-watch",
 ]
 
+# Agar dynamic pages se symbols extract na hon toh common liquid PSX symbols ka fallback
+FALLBACK_SYMBOLS = [
+    "OGDC", "PPL", "MARI", "PSO", "SNGP", "SSGC", "HUBC", "KEL", "MEBL", "HBL",
+    "UBL", "MCB", "NBP", "BAFL", "AKBL", "FABL", "LUCK", "DGKC", "MLCF", "FCCL",
+    "CHCC", "PIOC", "ENGRO", "FFC", "FFBL", "EFERT", "FATIMA", "SYS", "TRG", "NETSOL",
+    "AVN", "PAEL", "GATM", "NML", "ILP", "KTML", "SEARL", "GLAXO", "HALEON", "ATRL",
+    "PRL", "NRL", "BYCO", "CNERGY", "GHNI", "INDU", "HCAR", "PSMC", "MTL", "EPCL",
+]
 
-def _extract_symbols_from_html(html_text):
-    soup = BeautifulSoup(html_text, "html.parser")
+
+def _extract_symbols_from_text_or_html(text):
     symbols = []
     seen = set()
 
-    # 1) Table rows se pehla column try karein
-    for row in soup.select("table tr"):
-        cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-        if cols:
-            sym = cols[0].strip().upper()
-            if re.fullmatch(r"[A-Z0-9]{2,10}", sym) and sym not in seen:
-                seen.add(sym)
-                symbols.append(sym)
+    # 1) Agar response JSON ho toh keys/fields mein symbols dhoondein
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+            candidates = []
 
-    # 2) Agar table se symbols kam aayein toh /company/ ya /symbols/ links check karein
-    if len(symbols) < 10:
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            m = re.search(r"/(?:company|symbol|quotes)/([A-Za-z0-9]{2,10})", href)
-            if m:
-                sym = m.group(1).upper()
-                if sym not in seen:
+            def walk(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if str(k).lower() in ("symbol", "ticker", "scrip", "code") and isinstance(v, str):
+                            candidates.append(v)
+                        else:
+                            walk(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, str):
+                            candidates.append(item)
+                        else:
+                            walk(item)
+
+            walk(parsed)
+            for c in candidates:
+                sym = c.strip().upper()
+                if re.fullmatch(r"[A-Z]{2,10}", sym) and sym not in seen:
                     seen.add(sym)
                     symbols.append(sym)
+            if symbols:
+                return symbols
+        except Exception:
+            pass
+
+    # 2) HTML tables se symbols nikaalein
+    soup = BeautifulSoup(text, "html.parser")
+    for row in soup.select("table tr"):
+        cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+        for col in cols[:2]:
+            sym = re.sub(r"[^A-Za-z]", "", col).upper()
+            if 2 <= len(sym) <= 10 and sym.isupper() and sym not in seen:
+                seen.add(sym)
+                symbols.append(sym)
+                break
+
+    # 3) Links ya scripts mein /company/<SYMBOL> ya /quote/<SYMBOL> pattern dhoondein
+    for m in re.finditer(r"/(?:company|symbol|quote|quotes)/([A-Za-z]{2,10})", text):
+        sym = m.group(1).upper()
+        if sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
 
     return symbols
 
 
 def get_psx_symbols():
-    """Multiple PSX pages se symbols ki list nikaalta hai."""
-    for url in SYMBOL_URLS:
+    """PSX endpoints se symbols nikaalta hai; na milne par fallback list use karta hai."""
+    for url in SYMBOL_SOURCES:
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
             if resp.status_code != 200:
                 print(f"Skipping {url} -> HTTP {resp.status_code}")
                 continue
-
-            syms = _extract_symbols_from_html(resp.text)
-            print(f"Fetched {len(syms)} symbols from {url}")
-            if syms:
+            syms = _extract_symbols_from_text_or_html(resp.text)
+            print(f"Extracted {len(syms)} symbols from {url}")
+            if len(syms) >= 5:
                 return syms
         except Exception as e:
             print(f"Error fetching {url}: {e}")
             continue
 
-    raise RuntimeError("Could not fetch PSX symbols from any endpoint.")
+    print(f"Using fallback PSX symbol list ({len(FALLBACK_SYMBOLS)} symbols)")
+    return FALLBACK_SYMBOLS
 
 
 def get_52w_low_info(symbol):
