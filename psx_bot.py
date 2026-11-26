@@ -1,18 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 import os
 import re
 import smtplib
-import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from bs4 import BeautifulSoup
 import requests
 
 NEAR_LOW_PCT = 5.0          # 52-week low se kitne % tak ko near low maan'na hai
 SEND_WHEN_NO_MATCH = True   # Test ke liye True; jab sirf matches par email chahiye ho toh False kar dein
-MAX_WORKERS = 12            # Parallel threads
+MAX_WORKERS = 15            # All symbols ko tez scan karne ke liye parallel threads
+SYMBOLS_FILE = "symbols.txt"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -20,8 +20,7 @@ HEADERS = {
     "Referer": "https://dps.psx.com.pk/",
 }
 
-# Verified liquid PSX symbols list (aap ismein apni marzi ke symbols add/remove kar sakte hain)
-PSX_SYMBOLS = [
+DEFAULT_SYMBOLS = [
     "OGDC", "PPL", "MARI", "PSO", "SNGP", "SSGC", "HUBC", "KEL", "MEBL", "HBL",
     "UBL", "MCB", "NBP", "BAFL", "AKBL", "FABL", "LUCK", "DGKC", "MLCF", "FCCL",
     "CHCC", "PIOC", "ENGRO", "FFC", "FFBL", "EFERT", "FATIMA", "SYS", "TRG", "NETSOL",
@@ -31,11 +30,40 @@ PSX_SYMBOLS = [
 ]
 
 
+def load_all_symbols():
+    """symbols.txt se tamam symbols load karta hai; na ho toh DEFAULT_SYMBOLS use karta hai."""
+    symbols = []
+    seen = set()
+
+    def add_token(tok):
+        clean = re.sub(r"[^A-Za-z0-9]", "", tok.split("-")[0]).upper()
+        if 2 <= len(clean) <= 10 and not clean.isdigit() and clean not in seen:
+            seen.add(clean)
+            symbols.append(clean)
+
+    path = Path(SYMBOLS_FILE)
+    if path.exists():
+        raw_text = path.read_text(encoding="utf-8", errors="ignore")
+        for part in re.split(r"[\r\n,;|\t]+", raw_text):
+            tok = part.strip()
+            if tok and not tok.startswith("#"):
+                add_token(tok)
+        print(f"Loaded {len(symbols)} symbols from {SYMBOLS_FILE}")
+        if symbols:
+            return symbols
+
+    for s in DEFAULT_SYMBOLS:
+        add_token(s)
+    print(f"Using built-in symbol list ({len(symbols)} symbols)")
+    return symbols
+
+
 def _parse_52w_from_eod_json(payload):
     rows = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(rows, list) or not rows:
         return None
 
+    import time
     cutoff_sec = time.time() - (370 * 86400)
     closes = []
     lows = []
@@ -70,7 +98,6 @@ def _parse_52w_from_eod_json(payload):
 
 
 def _parse_52w_from_company_page(symbol):
-    """Fallback: /company/{symbol} page se 52-week range aur current price nikaalne ki koshish."""
     url = f"https://dps.psx.com.pk/company/{symbol}"
     r = requests.get(url, headers=HEADERS, timeout=15)
     if r.status_code != 200 or not r.text:
@@ -79,9 +106,7 @@ def _parse_52w_from_company_page(symbol):
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # Current price pattern (e.g., PKR 123.45 or Rs. 123.45)
     price_match = re.search(r"(?:PKR|Rs\.?)\s*([0-9]{1,6}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)", text, re.IGNORECASE)
-    # 52-week range pattern (e.g., 80.00 - 150.00)
     range_match = re.search(
         r"52[-\s]*W(?:eek)?\s*(?:Range|Low\s*/\s*High)?[^\d]{0,25}([0-9]{1,6}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*[-–/to]+\s*([0-9]{1,6}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
         text,
@@ -124,39 +149,30 @@ def check_symbol_52w(symbol):
 
 
 def scan_symbols(symbols):
-    clean_symbols = []
-    seen = set()
-    for s in symbols:
-        sym = str(s).strip().upper()
-        if sym and sym not in seen:
-            seen.add(sym)
-            clean_symbols.append(sym)
-
-    print(f"Scanning {len(clean_symbols)} symbols...")
+    print(f"Scanning {len(symbols)} symbols...")
     exact_lows = []
     near_lows = []
-    scanned_list = []
+    scanned_list = sorted(symbols)
+    data_found_count = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(check_symbol_52w, sym): sym for sym in clean_symbols}
+        futures = {pool.submit(check_symbol_52w, sym): sym for sym in scanned_list}
         for future in as_completed(futures):
-            sym = futures[future]
-            scanned_list.append(sym)
             res = future.result()
             if not res:
                 continue
+            data_found_count += 1
             _, _, _, diff_pct = res
             if diff_pct <= 0.1:
                 exact_lows.append(res)
             elif diff_pct <= NEAR_LOW_PCT:
                 near_lows.append(res)
 
-    scanned_list.sort()
     print(
-        f"Scan Complete | Attempted: {len(scanned_list)} | "
+        f"Scan Complete | Total Symbols: {len(scanned_list)} | Price Data Found: {data_found_count} | "
         f"At 52W Low: {len(exact_lows)} | Near 52W Low (<={NEAR_LOW_PCT}%): {len(near_lows)}"
     )
-    return scanned_list, exact_lows, near_lows
+    return scanned_list, data_found_count, exact_lows, near_lows
 
 
 def send_email(subject, body_text):
@@ -184,7 +200,8 @@ def send_email(subject, body_text):
 
 
 def main():
-    scanned_list, exact_lows, near_lows = scan_symbols(PSX_SYMBOLS)
+    symbols = load_all_symbols()
+    scanned_list, data_found_count, exact_lows, near_lows = scan_symbols(symbols)
     total_matches = len(exact_lows) + len(near_lows)
 
     if total_matches == 0 and not SEND_WHEN_NO_MATCH:
@@ -194,7 +211,7 @@ def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         f"PSX 52-Week Low Scan Report ({now_str})",
-        f"Total Symbols Scanned: {len(scanned_list)}",
+        f"Total Symbols Scanned: {len(scanned_list)} (Price Data Found: {data_found_count})",
         f"At 52W Low: {len(exact_lows)} | Near 52W Low (<= {NEAR_LOW_PCT}%): {len(near_lows)}",
         "",
         "=== AT 52-WEEK LOW ===",
